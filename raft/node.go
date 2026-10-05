@@ -71,6 +71,10 @@ type Node struct {
 	// 领导视图
 	nextIndex  map[string]int
 	matchIndex map[string]int
+
+	// 崩溃恢复与健康门禁：ready 之前不对外提供读取和提交
+	ready    bool
+	recovery *RecoveryReport
 }
 
 // NewNode 创建节点并从磁盘恢复持久化状态。
@@ -114,7 +118,7 @@ func NewNode(cfg Config, net *Network, logger *log.Logger) (*Node, error) {
 		}
 		n.kv, n.appliedSeq = ms.KV, ms.Seq
 	}
-	entries, err := store.LoadLog()
+	entries, residue, err := store.Recover(snapIdx)
 	if err != nil {
 		return nil, err
 	}
@@ -122,10 +126,52 @@ func NewNode(cfg Config, net *Network, logger *log.Logger) (*Node, error) {
 	// 重启后仅快照前缀被视为已提交；其余等领导下一次心跳确认后重新应用（幂等）。
 	n.commitIndex = snapIdx
 	n.lastApplied = snapIdx
+	n.recovery = &RecoveryReport{
+		NodeID:           cfg.ID,
+		Term:             hs.Term,
+		SnapshotIndex:    snapIdx,
+		SnapshotTerm:     snapTerm,
+		LoadedEntries:    len(entries),
+		RolledBack:       residue.Truncated,
+		StaleLogsRemoved: residue.StaleLogs,
+		TempFilesRemoved: residue.TempFiles,
+		CaughtUpFrom:     snapIdx,
+		CaughtUpTo:       snapIdx,
+	}
 	n.logf("recover term=%d votedFor=%q snapIndex=%d logLen=%d commitIndex=%d",
 		n.term, n.votedFor, n.snapIndex, len(n.entries), n.commitIndex)
+	n.logf("recovery report: %s", n.recovery.String())
 	return n, nil
 }
+
+// markReadyLocked 将节点标记为已恢复健康（持锁调用）。
+// 恢复报告在此刻定稿：记录追平到的位点。只有 ready 的节点才对外提供读取和提交。
+func (n *Node) markReadyLocked(cause string) {
+	if n.ready {
+		return
+	}
+	n.ready = true
+	n.recovery.CaughtUpTo = n.lastApplied
+	n.recovery.Ready = true
+	n.logf("ready (%s): %s", cause, n.recovery.String())
+}
+
+// Ready 报告节点是否已恢复到可对外服务的健康状态。
+func (n *Node) Ready() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.ready
+}
+
+// RecoveryReport 返回本次启动的崩溃恢复记录（副本，可 JSON 序列化）。
+func (n *Node) RecoveryReport() RecoveryReport {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return *n.recovery
+}
+
+// ArmCrash 在持久化层注入崩溃点（仅测试用）：到达指定阶段后模拟进程被强杀。
+func (n *Node) ArmCrash(stage string) { n.store.ArmCrash(stage) }
 
 func (n *Node) logf(format string, args ...any) {
 	if n.log != nil {
@@ -503,6 +549,10 @@ func (n *Node) advanceCommitLocked(term int) {
 		}
 	}
 	n.applyLocked()
+	// 领导在本任期提交过条目（含当选时的 no-op）后，才视为恢复健康。
+	if !n.ready && n.commitIndex > 0 && n.termAtLocked(n.commitIndex) == n.term {
+		n.markReadyLocked("leader committed entry in current term")
+	}
 }
 
 // ---- 日志复制（跟随者侧） ----
@@ -565,6 +615,10 @@ func (n *Node) HandleAppend(req AppendEntries) AppendEntriesReply {
 		n.commitIndex = min(req.LeaderCommit, n.lastIndexLocked())
 	}
 	n.applyLocked()
+	// 跟随者应用进度追平领导公布的提交位点后，才视为恢复健康。
+	if !n.ready && n.lastApplied >= req.LeaderCommit {
+		n.markReadyLocked("caught up with leader commit")
+	}
 	reply.Success = true
 	reply.MatchIndex = n.lastIndexLocked()
 	reply.Term = n.term
@@ -678,6 +732,11 @@ func (n *Node) Write(req ClientWrite) ClientReply {
 		n.mu.Unlock()
 		return ClientReply{OK: false, LeaderID: leader, Err: "not leader"}
 	}
+	if !n.ready {
+		// 崩溃恢复后尚未与集群收敛到健康状态，暂不接受提交
+		n.mu.Unlock()
+		return ClientReply{OK: false, LeaderID: n.cfg.ID, Err: "recovering: not consistent with cluster yet"}
+	}
 	// 幂等：已应用过的请求直接返回成功
 	if req.Seq <= n.appliedSeq[req.ClientID] {
 		reply := ClientReply{OK: true, Committed: true, LeaderID: n.cfg.ID}
@@ -724,11 +783,12 @@ func (n *Node) Write(req ClientWrite) ClientReply {
 // knownLeaderLocked 返回当前已知领导（简化实现：跟随者不跟踪，仅领导返回自己）。
 func (n *Node) knownLeaderLocked() string { return "" }
 
-// ReadCommitted 读取已提交状态机内容（仅领导响应，保证读到的是多数派已提交状态）。
+// ReadCommitted 读取已提交状态机内容（仅健康状态的领导响应，
+// 保证读到的是多数派已提交、且本机已完整应用的状态）。
 func (n *Node) ReadCommitted() (map[string]string, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.role != Leader {
+	if n.role != Leader || !n.ready {
 		return nil, false
 	}
 	out := make(map[string]string, len(n.kv))

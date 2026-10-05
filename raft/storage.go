@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -30,6 +31,136 @@ const (
 type Storage struct {
 	mu  sync.Mutex
 	dir string
+
+	// 故障注入（仅测试）：模拟进程在指定阶段被强杀。
+	crashAt string
+	crashed bool
+}
+
+// ArmCrash 注入崩溃点：到达 stage 阶段后存储进入“已崩溃”状态，
+// 当前多步操作中断、后续写操作全部失败，模拟强杀后磁盘保留中间态。
+func (s *Storage) ArmCrash(stage string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.crashAt = stage
+}
+
+var errCrashed = errors.New("storage crashed (fault injection)")
+
+// checkCrash 在故障注入点检查是否应“当场崩溃”（调用方须持锁）。
+func (s *Storage) checkCrash(stage string) error {
+	if s.crashed {
+		return errCrashed
+	}
+	if stage != "" && s.crashAt == stage {
+		s.crashed = true
+		s.crashAt = ""
+		return errCrashed
+	}
+	return nil
+}
+
+// Recover 清理上一轮崩溃残留并读出连续有效的日志前缀：
+//  1. 删除所有未完成的临时文件（*.tmp）；
+//  2. 删除已被快照覆盖（index <= snapIndex）的残留日志；
+//  3. 损坏或形成空洞的日志，从第一个异常点起整体截断。
+//
+// 该操作幂等：无论上一轮在何处中断、重复执行多少次，结果都相同。
+func (s *Storage) Recover(snapIndex int) ([]LogEntry, ResidueInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info := ResidueInfo{}
+
+	// 1) 清理临时文件
+	for _, dir := range []string{s.dir, filepath.Join(s.dir, logDirName)} {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, info, err
+		}
+		for _, e := range ents {
+			if strings.HasSuffix(e.Name(), ".tmp") {
+				os.Remove(filepath.Join(dir, e.Name()))
+				rel, _ := filepath.Rel(s.dir, filepath.Join(dir, e.Name()))
+				info.TempFiles = append(info.TempFiles, rel)
+			}
+		}
+	}
+
+	// 2) 读取全部日志文件；损坏文件删除并记录为截断点
+	byIndex := map[int]LogEntry{}
+	ents, err := os.ReadDir(filepath.Join(s.dir, logDirName))
+	if err != nil {
+		return nil, info, err
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".entry") {
+			continue
+		}
+		var idx int
+		if _, err := fmt.Sscanf(name, "%d.entry", &idx); err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(s.dir, logDirName, name))
+		if err != nil {
+			return nil, info, err
+		}
+		entry, ok := decodeLogEntry(raw)
+		if !ok {
+			// 损坏文件：删除并视为截断点
+			os.Remove(filepath.Join(s.dir, logDirName, name))
+			info.Truncated = append(info.Truncated, idx)
+			continue
+		}
+		byIndex[idx] = entry
+	}
+
+	// 3) 快照已覆盖的残留日志：删除
+	for idx := range byIndex {
+		if idx <= snapIndex {
+			delete(byIndex, idx)
+			os.Remove(logEntryPath(s.dir, idx))
+			info.StaleLogs = append(info.StaleLogs, idx)
+		}
+	}
+
+	// 4) 从 snapIndex+1 起走连续前缀；空洞之后的条目整体截断
+	valid := []LogEntry{}
+	next := snapIndex + 1
+	for {
+		e, ok := byIndex[next]
+		if !ok {
+			break
+		}
+		valid = append(valid, e)
+		delete(byIndex, next)
+		next++
+	}
+	for idx := range byIndex {
+		os.Remove(logEntryPath(s.dir, idx))
+		info.Truncated = append(info.Truncated, idx)
+	}
+
+	sort.Ints(info.StaleLogs)
+	sort.Ints(info.Truncated)
+	sort.Strings(info.TempFiles)
+	return valid, info, nil
+}
+
+// decodeLogEntry 解码并校验单条日志文件内容（crc32 + json）。
+func decodeLogEntry(raw []byte) (LogEntry, bool) {
+	if len(raw) < 4 {
+		return LogEntry{}, false
+	}
+	payload := raw[4:]
+	if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(raw[:4]) {
+		return LogEntry{}, false
+	}
+	var e LogEntry
+	if err := json.Unmarshal(payload, &e); err != nil {
+		return LogEntry{}, false
+	}
+	return e, true
 }
 
 // OpenStorage 打开（或创建）目录下的持久化存储。
@@ -40,7 +171,9 @@ func OpenStorage(dir string) (*Storage, error) {
 	return &Storage{dir: dir}, nil
 }
 
-func writeFileAtomic(dir, name string, data []byte) error {
+// writeFileAtomic 写临时文件 + fsync + rename 原子替换（调用方须持锁）。
+// 故障注入点 CrashAfterTmpWrite：临时文件落盘后、rename 前“崩溃”，留下 .tmp 残留。
+func (s *Storage) writeFileAtomic(dir, name string, data []byte) error {
 	tmp := filepath.Join(dir, name+".tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -57,6 +190,9 @@ func writeFileAtomic(dir, name string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
+	if err := s.checkCrash(CrashAfterTmpWrite); err != nil {
+		return err
+	}
 	return os.Rename(tmp, filepath.Join(dir, name))
 }
 
@@ -64,11 +200,14 @@ func writeFileAtomic(dir, name string, data []byte) error {
 func (s *Storage) SaveHardState(h hardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkCrash(""); err != nil {
+		return err
+	}
 	data, err := json.Marshal(h)
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.dir, hardStateFile, data)
+	return s.writeFileAtomic(s.dir, hardStateFile, data)
 }
 
 // LoadHardState 读取硬状态；首次启动返回零值。
@@ -95,9 +234,13 @@ func logEntryPath(dir string, index int) string {
 }
 
 // AppendLog 追加日志条目（逐条落盘并 fsync）。
+// 故障注入点 CrashMidAppend：批量写到一半“崩溃”，磁盘上只保留已写前缀。
 func (s *Storage) AppendLog(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkCrash(""); err != nil {
+		return err
+	}
 	for _, e := range entries {
 		payload, err := json.Marshal(e)
 		if err != nil {
@@ -106,52 +249,24 @@ func (s *Storage) AppendLog(entries []LogEntry) error {
 		buf := make([]byte, 4+len(payload))
 		binary.BigEndian.PutUint32(buf, crc32.ChecksumIEEE(payload))
 		copy(buf[4:], payload)
-		if err := writeFileAtomic(s.dir, filepath.Join(logDirName, fmt.Sprintf("%020d.entry", e.Index)), buf); err != nil {
+		if err := s.writeFileAtomic(s.dir, filepath.Join(logDirName, fmt.Sprintf("%020d.entry", e.Index)), buf); err != nil {
+			return err
+		}
+		if err := s.checkCrash(CrashMidAppend); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// LoadLog 读取全部日志条目（按下标排序，校验 CRC，损坏即报错）。
-func (s *Storage) LoadLog() ([]LogEntry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ents, err := os.ReadDir(filepath.Join(s.dir, logDirName))
-	if err != nil {
-		return nil, err
-	}
-	names := []string{}
-	for _, e := range ents {
-		names = append(names, e.Name())
-	}
-	sort.Strings(names)
-	out := []LogEntry{}
-	for _, name := range names {
-		raw, err := os.ReadFile(filepath.Join(s.dir, logDirName, name))
-		if err != nil {
-			return nil, err
-		}
-		if len(raw) < 4 {
-			return nil, fmt.Errorf("corrupt log file %s: too short", name)
-		}
-		payload := raw[4:]
-		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(raw[:4]) {
-			return nil, fmt.Errorf("corrupt log file %s: crc mismatch", name)
-		}
-		var e LogEntry
-		if err := json.Unmarshal(payload, &e); err != nil {
-			return nil, fmt.Errorf("corrupt log file %s: %w", name, err)
-		}
-		out = append(out, e)
-	}
-	return out, nil
-}
-
 // TruncateSuffix 删除从下标 index 开始（含）的日志文件。
+// 故障注入点 CrashMidTruncate：删到一半“崩溃”，磁盘上留下空洞后缀。
 func (s *Storage) TruncateSuffix(index int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkCrash(""); err != nil {
+		return err
+	}
 	ents, err := os.ReadDir(filepath.Join(s.dir, logDirName))
 	if err != nil {
 		return err
@@ -163,6 +278,9 @@ func (s *Storage) TruncateSuffix(index int) error {
 		}
 		if idx >= index {
 			if err := os.Remove(filepath.Join(s.dir, logDirName, e.Name())); err != nil {
+				return err
+			}
+			if err := s.checkCrash(CrashMidTruncate); err != nil {
 				return err
 			}
 		}
@@ -177,15 +295,23 @@ type snapshotMeta struct {
 }
 
 // SaveSnapshot 原子写入快照，并删除已包含的日志前缀文件。
+// 故障注入点 CrashSnapshotCompact：快照已替换、日志压缩前“崩溃”，
+// 磁盘上留下“新快照 + 旧日志”的残留，由 Recover 清理。
 func (s *Storage) SaveSnapshot(lastIndex, lastTerm int, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkCrash(""); err != nil {
+		return err
+	}
 	meta := snapshotMeta{LastIncludedIndex: lastIndex, LastIncludedTerm: lastTerm, Data: data}
 	buf, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(s.dir, snapshotFile, buf); err != nil {
+	if err := s.writeFileAtomic(s.dir, snapshotFile, buf); err != nil {
+		return err
+	}
+	if err := s.checkCrash(CrashSnapshotCompact); err != nil {
 		return err
 	}
 	// 压缩：删除 <= lastIndex 的日志文件
