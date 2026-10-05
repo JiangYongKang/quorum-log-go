@@ -2,7 +2,6 @@ package raft
 
 import (
 	"encoding/json"
-	"fmt"
 	"hash/fnv"
 	"log"
 	"math/rand"
@@ -62,6 +61,10 @@ type Node struct {
 	kv          map[string]string
 	appliedSeq  map[string]int64 // 客户端幂等表（已应用的最大 Seq）
 
+	// 崩溃恢复：重启后须先与集群收敛（healthy）才能对外提供读取与提交
+	healthy      bool
+	lastRecovery RecoveryReport
+
 	// 选举计时
 	electionElapsed  int
 	electionTimeout  int
@@ -96,34 +99,11 @@ func NewNode(cfg Config, net *Network, logger *log.Logger) (*Node, error) {
 	n.rand = rand.New(rand.NewSource(int64(h.Sum64())))
 	n.resetElectionTimeoutLocked()
 
-	// 恢复持久化状态
-	hs, err := store.LoadHardState()
-	if err != nil {
+	// 从磁盘恢复持久化状态（含残留清理与损坏尾部截断），生成恢复报告。
+	// 恢复后节点处于非健康状态，须与集群重新收敛后才能对外服务。
+	if err := n.recoverFromDisk(); err != nil {
 		return nil, err
 	}
-	n.term, n.votedFor = hs.Term, hs.VotedFor
-	snapIdx, snapTerm, data, err := store.LoadSnapshot()
-	if err != nil {
-		return nil, err
-	}
-	n.snapIndex, n.snapTerm = snapIdx, snapTerm
-	if len(data) > 0 {
-		var ms machineState
-		if err := json.Unmarshal(data, &ms); err != nil {
-			return nil, fmt.Errorf("load snapshot state: %w", err)
-		}
-		n.kv, n.appliedSeq = ms.KV, ms.Seq
-	}
-	entries, err := store.LoadLog()
-	if err != nil {
-		return nil, err
-	}
-	n.entries = entries
-	// 重启后仅快照前缀被视为已提交；其余等领导下一次心跳确认后重新应用（幂等）。
-	n.commitIndex = snapIdx
-	n.lastApplied = snapIdx
-	n.logf("recover term=%d votedFor=%q snapIndex=%d logLen=%d commitIndex=%d",
-		n.term, n.votedFor, n.snapIndex, len(n.entries), n.commitIndex)
 	return n, nil
 }
 
@@ -503,6 +483,10 @@ func (n *Node) advanceCommitLocked(term int) {
 		}
 	}
 	n.applyLocked()
+	// 本任期条目已被多数派提交：领导自身与集群收敛，恢复健康
+	if !n.healthy && n.commitIndex > 0 && n.termAtLocked(n.commitIndex) == n.term {
+		n.markHealthyLocked()
+	}
 }
 
 // ---- 日志复制（跟随者侧） ----
@@ -555,6 +539,10 @@ func (n *Node) HandleAppend(req AppendEntries) AppendEntriesReply {
 				}
 				n.entries = n.entries[:truncFrom-n.snapIndex-1]
 				n.logf("truncate suffix from index=%d", truncFrom)
+				// 恢复期间的回退记入恢复报告
+				if !n.healthy && n.lastRecovery.RolledBackFrom == 0 {
+					n.lastRecovery.RolledBackFrom = truncFrom
+				}
 			}
 			n.appendEntriesLocked(newEntries)
 			break
@@ -565,6 +553,10 @@ func (n *Node) HandleAppend(req AppendEntries) AppendEntriesReply {
 		n.commitIndex = min(req.LeaderCommit, n.lastIndexLocked())
 	}
 	n.applyLocked()
+	// 已按领导确认的提交位点应用完毕：与集群收敛，恢复健康
+	if !n.healthy && n.lastApplied >= n.commitIndex {
+		n.markHealthyLocked()
+	}
 	reply.Success = true
 	reply.MatchIndex = n.lastIndexLocked()
 	reply.Term = n.term
@@ -612,6 +604,10 @@ func (n *Node) HandleSnapshot(req InstallSnapshot) InstallSnapshotReply {
 	n.lastApplied = n.snapIndex
 	n.logf("install snapshot lastIncludedIndex=%d lastIncludedTerm=%d",
 		req.LastIncludedIndex, req.LastIncludedTerm)
+	// 快照整体替换后，已应用状态与领导确认的一致前缀对齐：恢复健康
+	if !n.healthy && n.lastApplied >= n.commitIndex {
+		n.markHealthyLocked()
+	}
 	return reply
 }
 
@@ -678,6 +674,12 @@ func (n *Node) Write(req ClientWrite) ClientReply {
 		n.mu.Unlock()
 		return ClientReply{OK: false, LeaderID: leader, Err: "not leader"}
 	}
+	// 门控：重启后须先与集群收敛（本任期有条目被多数派提交）才能对外提交。
+	if !n.healthy {
+		n.mu.Unlock()
+		n.broadcastAppend() // 促使本任期 no-op 尽快提交以恢复健康
+		return ClientReply{OK: false, LeaderID: n.cfg.ID, Err: "leader recovering, retry"}
+	}
 	// 幂等：已应用过的请求直接返回成功
 	if req.Seq <= n.appliedSeq[req.ClientID] {
 		reply := ClientReply{OK: true, Committed: true, LeaderID: n.cfg.ID}
@@ -724,11 +726,13 @@ func (n *Node) Write(req ClientWrite) ClientReply {
 // knownLeaderLocked 返回当前已知领导（简化实现：跟随者不跟踪，仅领导返回自己）。
 func (n *Node) knownLeaderLocked() string { return "" }
 
-// ReadCommitted 读取已提交状态机内容（仅领导响应，保证读到的是多数派已提交状态）。
+// ReadCommitted 读取已提交状态机内容。
+// 仅健康状态的领导响应：重启后未与集群重新收敛的节点不对外提供读取，
+// 保证读到的始终是多数派已提交且已完整应用的状态。
 func (n *Node) ReadCommitted() (map[string]string, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.role != Leader {
+	if n.role != Leader || !n.healthy {
 		return nil, false
 	}
 	out := make(map[string]string, len(n.kv))

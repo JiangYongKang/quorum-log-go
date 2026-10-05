@@ -68,6 +68,13 @@ func (c *Cluster) StopNode(id string) {
 	}
 }
 
+// KillNode 强杀一个节点：立即从网络摘除并停止时钟，不做任何收尾，
+// 等价于进程被 kill/掉电。持久化数据保留在磁盘（含可能的中途残留），
+// 由 RestartNode 时的崩溃恢复流程处理。
+func (c *Cluster) KillNode(id string) {
+	c.StopNode(id)
+}
+
 // RestartNode 重启节点：从磁盘重建状态并重新接入网络。
 func (c *Cluster) RestartNode(id string) error {
 	cfg := c.cfgs[id]

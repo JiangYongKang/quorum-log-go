@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -16,6 +17,28 @@ import (
 type hardState struct {
 	Term     int
 	VotedFor string
+}
+
+// CrashPoint 标识一个可注入崩溃的落盘步骤边界（测试用）。
+type CrashPoint struct {
+	Dir  string // 节点数据目录
+	Step string // 步骤名，如 tmp-written / snapshot-written / log-compacting
+}
+
+// crashHook 在关键落盘步骤之间被调用；返回 true 表示“此刻进程被强杀”，
+// 当前存储操作立即以 errSimulatedCrash 失败，磁盘上保留未完成的中途状态。
+// 仅测试注入使用，生产环境为 nil。
+var crashHook func(CrashPoint) bool
+
+// errSimulatedCrash 表示在注入点模拟的进程强杀：操作未完成，磁盘保留中途状态。
+var errSimulatedCrash = errors.New("simulated crash at disk step")
+
+// checkCrash 在当前步骤边界询问是否注入强杀。
+func checkCrash(dir, step string) error {
+	if crashHook != nil && crashHook(CrashPoint{Dir: dir, Step: step}) {
+		return errSimulatedCrash
+	}
+	return nil
 }
 
 const (
@@ -55,6 +78,10 @@ func writeFileAtomic(dir, name string, data []byte) error {
 		return err
 	}
 	if err := f.Close(); err != nil {
+		return err
+	}
+	// 注入点：临时文件已落盘、尚未 rename —— 此刻强杀会留下 .tmp 残留。
+	if err := checkCrash(dir, "tmp-written"); err != nil {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, name))
@@ -107,6 +134,10 @@ func (s *Storage) AppendLog(entries []LogEntry) error {
 		binary.BigEndian.PutUint32(buf, crc32.ChecksumIEEE(payload))
 		copy(buf[4:], payload)
 		if err := writeFileAtomic(s.dir, filepath.Join(logDirName, fmt.Sprintf("%020d.entry", e.Index)), buf); err != nil {
+			return err
+		}
+		// 注入点：批量追加的中途 —— 此刻强杀会在磁盘上留下部分批次。
+		if err := checkCrash(s.dir, "log-appended"); err != nil {
 			return err
 		}
 	}
@@ -165,6 +196,10 @@ func (s *Storage) TruncateSuffix(index int) error {
 			if err := os.Remove(filepath.Join(s.dir, logDirName, e.Name())); err != nil {
 				return err
 			}
+			// 注入点：后缀截断的中途 —— 此刻强杀会留下部分未删除的文件。
+			if err := checkCrash(s.dir, "log-truncating"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -188,6 +223,10 @@ func (s *Storage) SaveSnapshot(lastIndex, lastTerm int, data []byte) error {
 	if err := writeFileAtomic(s.dir, snapshotFile, buf); err != nil {
 		return err
 	}
+	// 注入点：快照已原子落盘、日志压缩尚未开始 —— 此刻强杀会留下过期日志文件。
+	if err := checkCrash(s.dir, "snapshot-written"); err != nil {
+		return err
+	}
 	// 压缩：删除 <= lastIndex 的日志文件
 	ents, err := os.ReadDir(filepath.Join(s.dir, logDirName))
 	if err != nil {
@@ -200,6 +239,10 @@ func (s *Storage) SaveSnapshot(lastIndex, lastTerm int, data []byte) error {
 		}
 		if idx <= lastIndex {
 			os.Remove(filepath.Join(s.dir, logDirName, e.Name()))
+			// 注入点：日志压缩的中途 —— 此刻强杀会留下部分过期日志。
+			if err := checkCrash(s.dir, "log-compacting"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -221,6 +264,98 @@ func (s *Storage) LoadSnapshot() (lastIndex, lastTerm int, data []byte, err erro
 		return 0, 0, nil, fmt.Errorf("corrupt snapshot: %w", err)
 	}
 	return meta.LastIncludedIndex, meta.LastIncludedTerm, meta.Data, nil
+}
+
+// LogRecovery 描述磁盘日志恢复的处理结果（供恢复报告使用）。
+type LogRecovery struct {
+	TruncatedFrom int      // 首个被截断的日志下标（0 表示无截断）
+	Removed       []string // 被清理的残留/损坏/过期文件名（相对数据目录）
+}
+
+// RecoverLog 在重启时把磁盘日志恢复为一致前缀，并清理上一轮中断的残留：
+//  1. 清理中断残留的临时文件（*.tmp，原子替换未完成）；
+//  2. 删除已被快照包含（<= snapIndex）的过期日志文件（快照压缩中途强杀的残留）；
+//  3. 依次校验余下日志的下标连续性（必须从 snapIndex+1 开始连续）与 CRC，
+//     首个损坏或不连续处起的后缀整体截断删除。
+//
+// 该过程幂等：无论此前被强杀多少次、中断在哪一步，多次执行结果一致；
+// 只删除确属残留或损坏的数据，不会误删仍有效的日志。
+func (s *Storage) RecoverLog(snapIndex int) ([]LogEntry, LogRecovery, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := LogRecovery{}
+
+	// 1) 清理临时文件残留（数据目录与日志目录）
+	for _, dir := range []string{s.dir, filepath.Join(s.dir, logDirName)} {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, rec, err
+		}
+		for _, e := range ents {
+			if strings.HasSuffix(e.Name(), ".tmp") {
+				os.Remove(filepath.Join(dir, e.Name()))
+				rel, _ := filepath.Rel(s.dir, filepath.Join(dir, e.Name()))
+				rec.Removed = append(rec.Removed, rel)
+			}
+		}
+	}
+
+	// 2)+3) 读取日志文件，删除过期项，校验连续性与 CRC
+	ents, err := os.ReadDir(filepath.Join(s.dir, logDirName))
+	if err != nil {
+		return nil, rec, err
+	}
+	names := []string{}
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	out := []LogEntry{}
+	expect := snapIndex + 1
+	truncated := false
+	for _, name := range names {
+		var idx int
+		if _, err := fmt.Sscanf(name, "%d.entry", &idx); err != nil {
+			continue
+		}
+		path := filepath.Join(s.dir, logDirName, name)
+		if truncated || idx <= snapIndex || idx != expect {
+			// 过期残留、或从首个空洞/损坏处起的后缀：删除
+			if !truncated && idx > snapIndex && idx != expect {
+				rec.TruncatedFrom = idx
+			}
+			if idx > snapIndex {
+				truncated = true
+				if rec.TruncatedFrom == 0 {
+					rec.TruncatedFrom = idx
+				}
+			}
+			os.Remove(path)
+			rec.Removed = append(rec.Removed, filepath.Join(logDirName, name))
+			continue
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, rec, err
+		}
+		valid := len(raw) >= 4 && crc32.ChecksumIEEE(raw[4:]) == binary.BigEndian.Uint32(raw[:4])
+		var e LogEntry
+		if valid {
+			valid = json.Unmarshal(raw[4:], &e) == nil && e.Index == idx
+		}
+		if !valid {
+			// 损坏文件（撕裂写入）：从该处起截断后缀
+			truncated = true
+			rec.TruncatedFrom = idx
+			os.Remove(path)
+			rec.Removed = append(rec.Removed, filepath.Join(logDirName, name))
+			continue
+		}
+		out = append(out, e)
+		expect++
+	}
+	return out, rec, nil
 }
 
 // Close 关闭存储。
